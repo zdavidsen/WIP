@@ -8,7 +8,7 @@ namespace TerminalApp
 {
   public interface ICommand
   {
-    Task Execute(string originalInput, object[] args, IEnvironmentResolver env, ITerminal terminal);
+    Task Execute(string originalInput, object?[] args, IEnvironmentResolver env, ITerminal terminal);
   }
 
   [AttributeUsage(AttributeTargets.Class, AllowMultiple = false)]

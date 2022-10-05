@@ -1,7 +1,9 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Threading.Tasks;
@@ -13,9 +15,17 @@ namespace TerminalApp
   {
     public IEnvironmentResolver Environment => this._env;
 
+    public string Prompt
+    {
+      get => GetVar("Prompt")?.ToString() ?? "> ";
+      set => SetVar("Prompt", value);
+    }
+
     internal readonly Environment _env;
     internal readonly Dictionary<string, CommandWrapper> _commands;
+
     private readonly ITerminal _realOutput;
+    private bool _running;
 
     public Application(string prompt = "> ")
     {
@@ -23,10 +33,23 @@ namespace TerminalApp
       this._commands = new Dictionary<string, CommandWrapper>();
       this._realOutput = new RealTerminal(this);
 
-      SetPrompt(prompt);
+      this.Prompt = prompt;
       this._currentPrompt = prompt;
 
       this._commands.Add("help", new InternalCommandWrapper(new HelpCommand(this)));
+      this._commands.Add("exit", new InternalCommandWrapper(new ExitCommand(this)));
+      RegisterCommand(typeof(EchoCommand));
+      RegisterCommand(typeof(SetVarCommand));
+    }
+
+    public void RegisterCommand(Type commandType)
+    {
+      var wrap = new CommandWrapper(commandType);
+      if (!wrap.IsValid)
+        throw new Exception($"Type '{commandType.FullName}' is not a valid command");
+      // explicitly overwrite any alias that may have the same name?
+      // TODO: reconsider concept of how command mapping and aliasing will work
+      this._commands[wrap.Name] = wrap;
     }
 
     public void RegisterEnvironmentNamespace(string @namespace, IEnvironmentResolver resolver)
@@ -34,9 +57,14 @@ namespace TerminalApp
       this._env.RegisterNamespaceResolver(@namespace, resolver);
     }
 
-    public void SetPrompt(string prompt)
+    public object? GetVar(string var)
     {
-      this.Environment.Set("Prompt", prompt);
+      return this._env.Resolve(var);
+    }
+
+    public void SetVar(string var, object? value)
+    {
+      this._env.Set(var, value);
     }
 
     // TODO
@@ -56,13 +84,17 @@ namespace TerminalApp
 
     public async Task Run()
     {
-      while (true)
+      this._running = true;
+      while (this._running)
       {
         try
         {
           // TODO
           //this._currentPrompt = InternalEvaluate("$Prompt", this._realOutput)?.ToString() ?? "> ";
-          this._currentPrompt = ResolveToken("$Prompt")?.ToString() ?? "> ";
+          var prompt = ResolveToken("$Prompt").ToString();
+          if (string.IsNullOrEmpty(prompt))
+            prompt = "> ";
+          this._currentPrompt = prompt;
           Console.Write(this._currentPrompt);
           var input = await ProcessInput();
           //foreach (var token in tokens)
@@ -78,6 +110,11 @@ namespace TerminalApp
       }
     }
 
+    public void Stop()
+    {
+      this._running = false;
+    }
+
     private Task InternalEvaluate(string input, ITerminal output)
     {
       // TODO: multiline support
@@ -85,15 +122,19 @@ namespace TerminalApp
       if (tokens.Count == 0)
         return Task.CompletedTask;
       // TODO: parse into an AST? and also respect parentheses?
-      var first = ResolveToken(tokens[0]);
-      if (first is CommandWrapper cmd)
+      var evals = tokens.Select(t => ResolveToken(t));
+      var first = evals.First();
+      if (first.WasResolved)
       {
-        return cmd.NewInstance().Execute(input, tokens.ToArray(), this.Environment, output);
-      }
-      else if (first is ResolvedToken resolved)
-      {
-        output.WriteObject(resolved.Resolved);
+        output.WriteObject(first.Resolved);
         return Task.CompletedTask;
+      }
+      else if (this._commands.ContainsKey(first.Original))
+      {
+        var cmd = this._commands[first.Original];
+        return 
+          cmd.NewInstance()
+            .Execute(input, evals.Select(e => e.GetValue()).ToArray(), this.Environment, output);
       }
       else
       {
@@ -101,25 +142,25 @@ namespace TerminalApp
       }
     }
 
-    private object? ResolveToken(string token)
+    private ResolvedToken ResolveToken(string token)
     {
       if (token[0] == '$')
       {
-        return new ResolvedToken(this.Environment.Resolve(token.Trim().TrimStart('$')));
+        return new ResolvedToken(token, true, this.Environment.Resolve(token.Trim().TrimStart('$')));
       }
       else if (token[0] == '"')
       {
-        return new ResolvedToken(token.Trim('"'));
+        return new ResolvedToken(token, true, token.Trim('"'));
       }
-      else if (this._commands.TryGetValue(token, out var wrapper))
-      {
-        return wrapper;
-      }
+      //else if (this._commands.TryGetValue(token, out var wrapper))
+      //{
+      //  return wrapper;
+      //}
       // TODO: try to resolve numbers?
-      return token;
+      return new ResolvedToken(token, false, null);
     }
 
-    // TODO: this is gonna require a whole tree structure isn't it...
+    // TODO: this is gonna require a whole AST isn't it...
     //private readonly Dictionary<char, char> _groupingConstructs =
     //  new Dictionary<char, char>
     //  {
@@ -160,23 +201,40 @@ namespace TerminalApp
 
     internal void WriteObject(object? obj)
     {
-      Console.WriteLine(obj?.ToString());
+      // TODO: write this to a background queue so that it doesn't have to wait for a lock
+      //  but is still synchronous
+      this._consoleLock.Wait();
+      try
+      {
+        WriteOutput(obj?.ToString());
+      }
+      finally
+      {
+        this._consoleLock.Release();
+      }
     }
 
     internal void WriteError(string error)
     {
-      var foreground = Console.ForegroundColor;
+      // TODO: write this to a background queue so that it doesn't have to wait for a lock
+      //  but is still synchronous
+      this._consoleLock.Wait();
+      try
+      {
+        var foreground = Console.ForegroundColor;
       Console.ForegroundColor = ConsoleColor.Red;
-      Console.WriteLine(error);
+      WriteOutput(error);
       Console.ForegroundColor = foreground;
+      }
+      finally
+      {
+        this._consoleLock.Release();
+      }
     }
 
     internal void WriteError(Exception e)
     {
-      var foreground = Console.ForegroundColor;
-      Console.ForegroundColor = ConsoleColor.Red;
-      Console.WriteLine(e.ToString());
-      Console.ForegroundColor = foreground;
+      WriteError(e.ToString());
     }
 
 
@@ -185,92 +243,188 @@ namespace TerminalApp
     // TODO: make this an... editor tree?
     private List<char> _input = new(256);
     private int _inputIndex;
+    private List<string> _history = new();
+    private int _historyIndex;
 
     private async Task<string> ProcessInput()
     {
       this._inputTop = Console.CursorTop;
+      this._input.Clear();
+      this._inputIndex = 0;
+      this._historyIndex = this._history.Count;
       while (true)
       {
         ConsoleKeyInfo key = Console.ReadKey(true);
-        switch (key)
+        await this._consoleLock.WaitAsync();
+        try
         {
-          case { Key: ConsoleKey.LeftArrow }:
-            if (--this._inputIndex < 0)
-              this._inputIndex = 0;
-            UpdateCursorPos();
-            break;
+          switch (key)
+          {
+            case { Key: ConsoleKey.LeftArrow }:
+              if (--this._inputIndex < 0)
+                this._inputIndex = 0;
+              UpdateCursorPos();
+              break;
 
-          case { Key: ConsoleKey.RightArrow }:
-            if (++this._inputIndex >= this._input.Count)
+            case { Key: ConsoleKey.RightArrow }:
+              if (++this._inputIndex >= this._input.Count)
+                this._inputIndex = this._input.Count;
+              UpdateCursorPos();
+              break;
+
+            case { Key: ConsoleKey.UpArrow }:
+              if (--this._historyIndex < 0)
+              {
+                this._historyIndex = 0;
+                continue;
+              }
+              EraseInput();
+              this._input.Clear();
+              this._input.AddRange(this._history[this._historyIndex]);
               this._inputIndex = this._input.Count;
-            UpdateCursorPos();
-            break;
-
-          case { Key: ConsoleKey.Escape }:
-            EraseInputFromTerminal();
-            Console.SetCursorPosition(0, this._inputTop);
-            Console.Write(this._currentPrompt);
-            this._input.Clear();
-            this._inputIndex = 0;
-            UpdateCursorPos();
-            break;
-
-          case { Key: ConsoleKey.Backspace }:
-            if (this._inputIndex <= 0)
+              RewriteInputFrom(0);
               break;
-            RemoveCharAt(--this._inputIndex);
-            break;
 
-          case { Key: ConsoleKey.Delete }:
-            if (this._inputIndex >= this._input.Count)
+            case { Key: ConsoleKey.DownArrow }:
+              if (++this._historyIndex >= this._history.Count)
+              {
+                this._historyIndex = this._history.Count - 1;
+                continue;
+              }
+              EraseInput();
+              this._input.Clear();
+              this._input.AddRange(this._history[this._historyIndex]);
+              this._inputIndex = this._input.Count;
+              RewriteInputFrom(0);
               break;
-            RemoveCharAt(this._inputIndex);
-            break;
 
-          case { Key: ConsoleKey.Enter }:
-            Console.WriteLine();
-            var input = string.Join("", this._input);
-            this._input.Clear();
-            this._inputIndex = 0;
-            return input;
+            case { Key: ConsoleKey.Escape }:
+              EraseInput();
+              this._input.Clear();
+              this._inputIndex = 0;
+              UpdateCursorPos();
+              break;
 
-          default:
-            if (key.KeyChar != 0)
-              this._input.Insert(this._inputIndex++, key.KeyChar);
-            Console.Write(key.KeyChar);
-            RewriteInputFrom(this._inputIndex);
-            break;
+            case { Key: ConsoleKey.Backspace }:
+              if (this._inputIndex <= 0)
+                break;
+              RemoveCharAt(--this._inputIndex);
+              break;
+
+            case { Key: ConsoleKey.Delete }:
+              if (this._inputIndex >= this._input.Count)
+                break;
+              RemoveCharAt(this._inputIndex);
+              break;
+
+            case { Key: ConsoleKey.Enter }:
+              WriteInput(System.Environment.NewLine);
+              var input = string.Join("", this._input);
+              if (this._history.Count == 0 || this._history.Last() != input)
+              {
+                if (this._history.Count >= 100)
+                  this._history.RemoveAt(0);
+                this._history.Add(input);
+              }
+              this._input.Clear();
+              this._inputIndex = 0;
+              this._currentPrompt = "";
+              this._inputTop = Console.CursorTop;
+              return input;
+
+            default:
+              if (key.KeyChar != 0)
+                this._input.Insert(this._inputIndex++, key.KeyChar);
+              WriteInput(key.KeyChar);
+              RewriteInputFrom(this._inputIndex);
+              break;
+          }
+        }
+        finally
+        {
+          this._consoleLock.Release();
         }
       }
     }
 
-    private void UpdateCursorPos()
+
+    private SemaphoreSlim _consoleLock = new SemaphoreSlim(1);
+
+    [Conditional("DEBUG")]
+    private void CheckLock([CallerMemberName] string caller = "")
     {
-      Console.CursorLeft = this._currentPrompt.Length + this._inputIndex;
+      if (this._consoleLock.CurrentCount != 0)
+        throw new InvalidOperationException($"_consoleLock must be locked before calling {caller}");
+    }
+
+    private void WriteInput(string input)
+    {
+      CheckLock();
+      Console.Write(input);
+    }
+
+    private void WriteInput(char input)
+    {
+      CheckLock();
+      Console.Write(input);
+    }
+
+    private void WriteOutput(object? output)
+    {
+      CheckLock();
+      ErasePromptAndInput();
+      Console.Write(output?.ToString());
+      Console.WriteLine();
+      this._inputTop = Console.CursorTop;
+      Console.Write(this._currentPrompt);
+      RewriteInputFrom(0);
+    }
+
+    private void UpdateCursorPos(int? index = null)
+    {
+      CheckLock();
+      if (index == null)
+        index = this._inputIndex;
+      var len = this._currentPrompt.Length + index.Value;
+      Console.SetCursorPosition(len % Console.BufferWidth, this._inputTop + len / Console.BufferWidth);
     }
 
     private void RemoveCharAt(int index)
     {
+      CheckLock();
       var printedLength = this._currentPrompt.Length + this._input.Count - 1;
       this._input.RemoveAt(index);
       Console.SetCursorPosition(printedLength % Console.BufferWidth, this._inputTop + printedLength / Console.BufferWidth);
+      // this is only needed if deleting the last character
       Console.Write(' ');
-      UpdateCursorPos();
       RewriteInputFrom(index);
     }
 
     private void RewriteInputFrom(int index)
     {
+      CheckLock();
+      UpdateCursorPos(index);
       // TODO: optimize this... like a lot
       for (int i = index; i < this._input.Count; i++)
         Console.Write(this._input[i]);
       UpdateCursorPos();
     }
 
-    private void EraseInputFromTerminal()
+    private void ErasePromptAndInput()
     {
-      Console.CursorLeft = 0;
+      CheckLock();
+      // TODO: optimize this... like a lot
+      Console.SetCursorPosition(0, this._inputTop);
       for (int i = 0; i < this._currentPrompt.Length + this._input.Count; i++)
+        Console.Write(' ');
+    }
+
+    private void EraseInput()
+    {
+      CheckLock();
+      // TODO: optimize this... like a lot
+      Console.SetCursorPosition(this._currentPrompt.Length, this._inputTop);
+      for (int i = 0; i < this._input.Count; i++)
         Console.Write(' ');
     }
 
@@ -278,13 +432,23 @@ namespace TerminalApp
 
 
     private struct ResolvedToken 
-    { 
+    {
+      public string Original { get; }
+      public bool WasResolved { get; }
       public object? Resolved { get; }
-      public ResolvedToken(object? resolved) { this.Resolved = resolved; }
+      public ResolvedToken(string original, bool wasResolved, object? value) 
+      { 
+        this.Original = original;
+        this.WasResolved = wasResolved;
+        this.Resolved = value; 
+      }
+
+      public object? GetValue()
+        => WasResolved ? Resolved : Original;
 
       public override string ToString()
       {
-        return Resolved?.ToString() ?? "";
+        return GetValue()?.ToString() ?? "";
       }
     }
 
